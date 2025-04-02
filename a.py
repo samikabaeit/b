@@ -1,166 +1,197 @@
 import logging
 from dataclasses import dataclass
-from typing import Optional
-
+from typing import Optional, List
 from dotenv import load_dotenv
-
 from livekit import api
 from livekit.agents import (
-    Agent,
-    AgentSession,
-    ChatContext,
-    JobContext,
-    JobProcess,
-    RoomInputOptions,
-    RoomOutputOptions,
-    RunContext,
-    WorkerOptions,
-    cli,
-    metrics,
+    Agent, AgentSession, ChatContext, JobContext, JobProcess,
+    RoomInputOptions, RoomOutputOptions, RunContext, WorkerOptions,
+    cli, metrics, function_tool
 )
-from livekit.agents.job import get_current_job_context
-from livekit.agents.llm import function_tool
-from livekit.agents.voice import MetricsCollectedEvent
 from livekit.plugins import deepgram, openai, silero
 
-logger = logging.getLogger("virtual-doorman")
+logger = logging.getLogger("smart-doorman")
 load_dotenv()
 
-# Shared data structure between agents
+# Shared data structure for all agents
 @dataclass
-class VisitData:
+class DoormanData:
+    intent: Optional[str] = None
     resident_name: Optional[str] = None
     apartment: Optional[str] = None
     visitor_name: Optional[str] = None
-    visit_reason: Optional[str] = None
+    maintenance_issue: Optional[str] = None
+    vacancies: List[str] = None
 
-# Mock database functions - replace with real DB calls
-async def verify_resident(name: str, apartment: str) -> bool:
-    # In real implementation, query your database
-    logger.info(f"Checking resident: {name} in apartment {apartment}")
-    return True  # Mock validation
+# Mock database and services - implement these!
+async def find_resident(name: str, apartment: str) -> bool:
+    """Check resident exists in database"""
+    return True  # Implement real DB check
 
-async def verify_visitor(resident_name: str, visitor_name: str) -> bool:
-    # In real implementation, query your database
-    logger.info(f"Checking visitor {visitor_name} for resident {resident_name}")
-    return True  # Mock validation
+async def get_vacancies() -> List[str]:
+    """Get list of available apartments"""
+    return ["501", "302", "105"]  # Mock data
 
-async def log_visit(visit_data: VisitData) -> None:
-    logger.info(f"Logging visit: {visit_data}")
+async def send_sms(number: str, message: str) -> bool:
+    """Send SMS notification"""
+    logger.info(f"SMS to {number}: {message}")
+    return True
 
-class ResidentAgent(Agent):
-    def __init__(self) -> None:
+async def open_door() -> bool:
+    """Trigger door opening mechanism"""
+    logger.info("Door opened")
+    return True
+
+# -------------------- Agents -------------------- 
+class MainAgent(Agent):
+    def __init__(self):
         super().__init__(
-            instructions="You are a virtual doorman. Your task is to: "
-            "1. Greet the resident politely "
-            "2. Ask for their full name and apartment number "
-            "3. Verify this information matches our records "
-            "Keep responses brief and professional.",
+            instructions="You are the main concierge. Determine user's need from: "
+            "1. Visitor registration 2. Delivery 3. Maintenance 4. Rental info "
+            "Ask clarifying questions if needed. Be polite and professional.",
             llm=openai.LLM(model="gpt-4o-mini"),
-            tts=openai.TTS(voice="nova"),
+            tts=openai.TTS(voice="nova")
         )
 
     async def on_enter(self):
         self.session.generate_reply()
 
     @function_tool
-    async def verify_resident_info(
-        self, 
-        context: RunContext[VisitData],
-        resident_name: str,
-        apartment: str
-    ):
-        """Verify resident information against database records."""
+    async def route_conversation(self, context: RunContext[DoormanData], intent: str):
+        """Route to appropriate specialist based on determined intent"""
+        intent = intent.lower()
+        context.userdata.intent = intent
         
-        is_valid = await verify_resident(resident_name, apartment)
-        if not is_valid:
-            return None, "Sorry, we couldn't verify your information. Please try again."
+        agents = {
+            "visitor": VisitorAgent,
+            "delivery": DeliveryAgent,
+            "maintenance": MaintenanceAgent,
+            "rental": RentalAgent
+        }
         
-        # Update shared data
-        context.userdata.resident_name = resident_name
-        context.userdata.apartment = apartment
+        if intent not in agents:
+            return None, "Sorry, I didn't understand. Please try again."
         
-        # Hand off to VisitorAgent
-        visitor_agent = VisitorAgent()
-        return visitor_agent, "Thank you! Now let's register your visitor."
+        return agents[intent](), f"Connecting you to {intent.capitalize()} services"
 
 class VisitorAgent(Agent):
     def __init__(self):
         super().__init__(
-            instructions="You are a visitor registration system. Your task is to: "
-            "1. Ask for the visitor's full name "
-            "2. Ask for the reason of the visit "
-            "3. Verify this information with building records "
-            "Keep responses professional and concise.",
+            instructions="Handle visitor registration. Collect: "
+            "- Resident full name - Apartment number "
+            "- Visitor name - Send SMS notification to resident",
             llm=openai.LLM(model="gpt-4o-mini"),
-            tts=openai.TTS(voice="nova"),
+            tts=openai.TTS(voice="nova")
         )
-
-    async def on_enter(self):
-        self.session.generate_reply()
 
     @function_tool
-    async def verify_visitor_info(
-        self,
-        context: RunContext[VisitData],
-        visitor_name: str,
-        visit_reason: str
-    ):
-        """Finalize visitor registration and log the visit."""
-        
-        # Validate visitor information
-        is_valid = await verify_visitor(
-            context.userdata.resident_name,
-            visitor_name
-        )
-        
-        if not is_valid:
-            return None, "Visitor not found in our records. Please check the name and try again."
-        
-        # Update shared data
+    async def register_visitor(self, context: RunContext[DoormanData],
+                             resident_name: str, apartment: str, visitor_name: str):
+        """Finalize visitor registration"""
+        if not await find_resident(resident_name, apartment):
+            return None, "Resident not found"
+            
+        context.userdata.resident_name = resident_name
+        context.userdata.apartment = apartment
         context.userdata.visitor_name = visitor_name
-        context.userdata.visit_reason = visit_reason
         
-        # Log the visit
-        await log_visit(context.userdata)
+        # Implement real SMS gateway integration
+        await send_sms("+1234567890", 
+                      f"Visitor {visitor_name} arrived for {resident_name}")
         
-        # Generate final response
-        job_ctx = get_current_job_context()
-        await job_ctx.room.disconnect()
-        return None, "Visitor registered successfully. The resident has been notified. Thank you!"
+        await context.session.room.disconnect()
+        return None, "Resident notified. Visitor registered!"
 
+class DeliveryAgent(Agent):
+    def __init__(self):
+        super().__init__(
+            instructions="Handle package deliveries. Verify resident info and open door",
+            llm=openai.LLM(model="gpt-4o-mini"),
+            tts=openai.TTS(voice="nova")
+        )
+
+    @function_tool
+    async def handle_delivery(self, context: RunContext[DoormanData],
+                            resident_name: str, apartment: str):
+        """Process delivery request"""
+        if not await find_resident(resident_name, apartment):
+            return None, "Resident not found"
+        
+        await open_door()
+        await context.session.room.disconnect()
+        return None, "Door opened. Please leave package in lobby."
+
+class MaintenanceAgent(Agent):
+    def __init__(self):
+        super().__init__(
+            instructions="Handle maintenance requests. Collect: "
+            "- Resident name - Apartment - Issue description",
+            llm=openai.LLM(model="gpt-4o-mini"),
+            tts=openai.TTS(voice="nova")
+        )
+
+    @function_tool
+    async def log_request(self, context: RunContext[DoormanData],
+                         issue: str):
+        """Record maintenance issue"""
+        context.userdata.maintenance_issue = issue
+        # Implement real ticketing system integration
+        await send_sms("+1987654321", 
+                      f"Maintenance needed {context.userdata.apartment}: {issue}")
+        
+        await context.session.room.disconnect()
+        return None, "Request logged. Technician will arrive within 2 hours."
+
+class RentalAgent(Agent):
+    def __init__(self):
+        super().__init__(
+            instructions="Provide rental information. List vacancies and notify owner",
+            llm=openai.LLM(model="gpt-4o-mini"),
+            tts=openai.TTS(voice="nova")
+        )
+
+    @function_tool
+    async def list_vacancies(self, context: RunContext[DoormanData]):
+        """Show available apartments and notify owner"""
+        vacancies = await get_vacancies()
+        context.userdata.vacancies = vacancies
+        
+        await send_sms("+1122334455", 
+                      "New rental inquiry received - please follow up")
+        
+        await context.session.room.disconnect()
+        return None, f"Available units: {', '.join(vacancies)}. Owner notified."
+
+# -------------------- System Setup --------------------
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
-
-    session = AgentSession[VisitData](
+    
+    session = AgentSession[DoormanData](
         vad=ctx.proc.userdata["vad"],
         llm=openai.LLM(model="gpt-4o-mini"),
         stt=deepgram.STT(model="nova-3"),
         tts=openai.TTS(voice="nova"),
-        userdata=VisitData(),
+        userdata=DoormanData()
     )
 
+    # Metrics collection
     usage_collector = metrics.UsageCollector()
-
-    @session.on("metrics_collected")
-    def _on_metrics_collected(ev: MetricsCollectedEvent):
-        metrics.log_metrics(ev.metrics)
+    session.on("metrics_collected", lambda ev: (
+        metrics.log_metrics(ev.metrics),
         usage_collector.collect(ev.metrics)
-
-    async def log_usage():
-        summary = usage_collector.get_summary()
-        logger.info(f"Usage: {summary}")
-
-    ctx.add_shutdown_callback(log_usage)
+    ))
+    
+    ctx.add_shutdown_callback(lambda: logger.info(
+        f"Usage Summary: {usage_collector.get_summary()}"))
 
     await session.start(
-        agent=ResidentAgent(),
+        agent=MainAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(),
-        room_output_options=RoomOutputOptions(transcription_enabled=True),
+        room_output_options=RoomOutputOptions(transcription_enabled=True)
     )
 
 if __name__ == "__main__":
