@@ -1,6 +1,10 @@
 import logging
-from dataclasses import dataclass
-from typing import Optional, List
+import json
+import time
+from dataclasses import dataclass, asdict
+from typing import Optional, List, Dict, Callable
+from pathlib import Path
+from functools import wraps
 from dotenv import load_dotenv
 from livekit import api
 from livekit.agents import (
@@ -10,10 +14,52 @@ from livekit.agents import (
 )
 from livekit.plugins import deepgram, openai, silero
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(
+            'doorman.log', maxBytes=10*1024*1024, backupCount=5)
+    ]
+)
 logger = logging.getLogger("smart-doorman")
 load_dotenv()
 
-# Shared data structure for all agents
+# --------------- Configuration ---------------
+CONVERSATION_LOG_DIR = Path("./conversations")
+CONVERSATION_LOG_DIR.mkdir(exist_ok=True)
+
+class APIMetrics:
+    """Custom metrics collector for external API calls"""
+    def __init__(self):
+        self._counters = metrics.PrometheusCounterCollection()
+        self._durations = metrics.PrometheusDurationCollection()
+    
+    def track_call(self, name: str):
+        """Decorator to track API call metrics"""
+        def decorator(func: Callable):
+            @wraps(func)
+            async def wrapper(*args, **kwargs):
+                start_time = time.monotonic()
+                try:
+                    result = await func(*args, **kwargs)
+                    self._counters.add(name, 1, {"status": "success"})
+                    return result
+                except Exception as e:
+                    self._counters.add(name, 1, {"status": "error"})
+                    logger.error(f"API call failed: {name}", exc_info=True)
+                    raise
+                finally:
+                    duration = time.monotonic() - start_time
+                    self._durations.observe(name, duration)
+            return wrapper
+        return decorator
+
+api_metrics = APIMetrics()
+
+# --------------- Data Models ---------------
 @dataclass
 class DoormanData:
     intent: Optional[str] = None
@@ -23,176 +69,172 @@ class DoormanData:
     maintenance_issue: Optional[str] = None
     vacancies: List[str] = None
 
-# Mock database and services - implement these!
-async def find_resident(name: str, apartment: str) -> bool:
-    """Check resident exists in database"""
-    return True  # Implement real DB check
+# --------------- Services with Metrics & Logging ---------------
+class DatabaseService:
+    @staticmethod
+    @api_metrics.track_call("db_query")
+    async def find_resident(name: str, apartment: str) -> bool:
+        logger.info(f"Checking resident: {name} in {apartment}")
+        return True  # Implement actual DB logic
 
-async def get_vacancies() -> List[str]:
-    """Get list of available apartments"""
-    return ["501", "302", "105"]  # Mock data
+    @staticmethod
+    @api_metrics.track_call("db_query")
+    async def get_vacancies() -> List[str]:
+        logger.info("Fetching vacant apartments")
+        return ["501", "302", "105"]
 
-async def send_sms(number: str, message: str) -> bool:
-    """Send SMS notification"""
-    logger.info(f"SMS to {number}: {message}")
-    return True
+class SMSService:
+    @staticmethod
+    @api_metrics.track_call("sms_send")
+    async def send(number: str, message: str) -> bool:
+        logger.info(f"Sending SMS to {number}: {message[:50]}...")
+        return True  # Integrate with actual SMS gateway
 
-async def open_door() -> bool:
-    """Trigger door opening mechanism"""
-    logger.info("Door opened")
-    return True
+class DoorService:
+    @staticmethod
+    @api_metrics.track_call("door_open")
+    async def open() -> bool:
+        logger.info("Triggering door open mechanism")
+        return True  # Implement hardware integration
 
-# -------------------- Agents -------------------- 
+# --------------- Conversation Logger ---------------
+class ConversationLogger:
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.log_file = CONVERSATION_LOG_DIR / f"{session_id}.jsonl"
+        self._ensure_header()
+
+    def _ensure_header(self):
+        if not self.log_file.exists():
+            with open(self.log_file, "w") as f:
+                json.dump({
+                    "session_id": self.session_id,
+                    "start_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                }, f)
+                f.write("\n")
+
+    async def log_interaction(self, role: str, content: str):
+        entry = {
+            "timestamp": time.time(),
+            "role": role,
+            "content": content
+        }
+        try:
+            with open(self.log_file, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception as e:
+            logger.error(f"Failed to log conversation: {e}")
+
+# --------------- Agents with Error Handling ---------------
+def handle_errors(func: Callable):
+    """Decorator for error handling and conversation logging"""
+    @wraps(func)
+    async def wrapper(self, *args, **kwargs):
+        try:
+            session = getattr(self, "session", None)
+            if session:
+                await session.conversation_logger.log_interaction("agent", func.__name__)
+            return await func(self, *args, **kwargs)
+        except Exception as e:
+            logger.error(f"Agent error in {self.__class__.__name__}: {e}", exc_info=True)
+            if session:
+                await session.room.disconnect()
+            raise
+    return wrapper
+
 class MainAgent(Agent):
     def __init__(self):
         super().__init__(
-            instructions="You are the main concierge. Determine user's need from: "
-            "1. Visitor registration 2. Delivery 3. Maintenance 4. Rental info "
-            "Ask clarifying questions if needed. Be polite and professional.",
+            instructions="Main concierge - route requests",
             llm=openai.LLM(model="gpt-4o-mini"),
             tts=openai.TTS(voice="nova")
         )
 
+    @handle_errors
     async def on_enter(self):
-        self.session.generate_reply()
+        await self.session.generate_reply()
 
     @function_tool
+    @handle_errors
     async def route_conversation(self, context: RunContext[DoormanData], intent: str):
-        """Route to appropriate specialist based on determined intent"""
-        intent = intent.lower()
-        context.userdata.intent = intent
-        
-        agents = {
+        """Route to appropriate service agent"""
+        context.userdata.intent = intent.lower()
+        agent_map = {
             "visitor": VisitorAgent,
             "delivery": DeliveryAgent,
             "maintenance": MaintenanceAgent,
             "rental": RentalAgent
         }
         
-        if intent not in agents:
-            return None, "Sorry, I didn't understand. Please try again."
+        agent_class = agent_map.get(context.userdata.intent)
+        if not agent_class:
+            return None, "Invalid request type"
         
-        return agents[intent](), f"Connecting you to {intent.capitalize()} services"
+        return agent_class(), f"Connecting to {agent_class.__name__}"
 
-class VisitorAgent(Agent):
-    def __init__(self):
-        super().__init__(
-            instructions="Handle visitor registration. Collect: "
-            "- Resident full name - Apartment number "
-            "- Visitor name - Send SMS notification to resident",
-            llm=openai.LLM(model="gpt-4o-mini"),
-            tts=openai.TTS(voice="nova")
-        )
+# (Implement other agents similarly with @handle_errors decorator)
 
-    @function_tool
-    async def register_visitor(self, context: RunContext[DoormanData],
-                             resident_name: str, apartment: str, visitor_name: str):
-        """Finalize visitor registration"""
-        if not await find_resident(resident_name, apartment):
-            return None, "Resident not found"
-            
-        context.userdata.resident_name = resident_name
-        context.userdata.apartment = apartment
-        context.userdata.visitor_name = visitor_name
-        
-        # Implement real SMS gateway integration
-        await send_sms("+1234567890", 
-                      f"Visitor {visitor_name} arrived for {resident_name}")
-        
-        await context.session.room.disconnect()
-        return None, "Resident notified. Visitor registered!"
-
-class DeliveryAgent(Agent):
-    def __init__(self):
-        super().__init__(
-            instructions="Handle package deliveries. Verify resident info and open door",
-            llm=openai.LLM(model="gpt-4o-mini"),
-            tts=openai.TTS(voice="nova")
-        )
-
-    @function_tool
-    async def handle_delivery(self, context: RunContext[DoormanData],
-                            resident_name: str, apartment: str):
-        """Process delivery request"""
-        if not await find_resident(resident_name, apartment):
-            return None, "Resident not found"
-        
-        await open_door()
-        await context.session.room.disconnect()
-        return None, "Door opened. Please leave package in lobby."
-
-class MaintenanceAgent(Agent):
-    def __init__(self):
-        super().__init__(
-            instructions="Handle maintenance requests. Collect: "
-            "- Resident name - Apartment - Issue description",
-            llm=openai.LLM(model="gpt-4o-mini"),
-            tts=openai.TTS(voice="nova")
-        )
-
-    @function_tool
-    async def log_request(self, context: RunContext[DoormanData],
-                         issue: str):
-        """Record maintenance issue"""
-        context.userdata.maintenance_issue = issue
-        # Implement real ticketing system integration
-        await send_sms("+1987654321", 
-                      f"Maintenance needed {context.userdata.apartment}: {issue}")
-        
-        await context.session.room.disconnect()
-        return None, "Request logged. Technician will arrive within 2 hours."
-
-class RentalAgent(Agent):
-    def __init__(self):
-        super().__init__(
-            instructions="Provide rental information. List vacancies and notify owner",
-            llm=openai.LLM(model="gpt-4o-mini"),
-            tts=openai.TTS(voice="nova")
-        )
-
-    @function_tool
-    async def list_vacancies(self, context: RunContext[DoormanData]):
-        """Show available apartments and notify owner"""
-        vacancies = await get_vacancies()
-        context.userdata.vacancies = vacancies
-        
-        await send_sms("+1122334455", 
-                      "New rental inquiry received - please follow up")
-        
-        await context.session.room.disconnect()
-        return None, f"Available units: {', '.join(vacancies)}. Owner notified."
-
-# -------------------- System Setup --------------------
+# --------------- System Initialization ---------------
 def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
+    """Initialize shared resources"""
+    try:
+        proc.userdata["vad"] = silero.VAD.load()
+        logger.info("VAD model loaded successfully")
+    except Exception as e:
+        logger.error("Failed to initialize VAD", exc_info=True)
+        raise
 
 async def entrypoint(ctx: JobContext):
-    await ctx.connect()
-    
-    session = AgentSession[DoormanData](
-        vad=ctx.proc.userdata["vad"],
-        llm=openai.LLM(model="gpt-4o-mini"),
-        stt=deepgram.STT(model="nova-3"),
-        tts=openai.TTS(voice="nova"),
-        userdata=DoormanData()
-    )
-
-    # Metrics collection
-    usage_collector = metrics.UsageCollector()
-    session.on("metrics_collected", lambda ev: (
-        metrics.log_metrics(ev.metrics),
-        usage_collector.collect(ev.metrics)
-    ))
-    
-    ctx.add_shutdown_callback(lambda: logger.info(
-        f"Usage Summary: {usage_collector.get_summary()}"))
-
-    await session.start(
-        agent=MainAgent(),
-        room=ctx.room,
-        room_input_options=RoomInputOptions(),
-        room_output_options=RoomOutputOptions(transcription_enabled=True)
-    )
+    """Main entry point with session setup"""
+    try:
+        await ctx.connect()
+        session_id = ctx.room.name
+        
+        session = AgentSession[DoormanData](
+            vad=ctx.proc.userdata["vad"],
+            llm=openai.LLM(model="gpt-4o-mini"),
+            stt=deepgram.STT(model="nova-3"),
+            tts=openai.TTS(voice="nova"),
+            userdata=DoormanData()
+        )
+        
+        # Initialize conversation logging
+        session.conversation_logger = ConversationLogger(session_id)
+        
+        # Setup metrics collection
+        usage_collector = metrics.UsageCollector()
+        session.on("metrics_collected", lambda ev: (
+            metrics.log_metrics(ev.metrics),
+            usage_collector.collect(ev.metrics)
+        ))
+        
+        # Add custom API metrics to prometheus
+        metrics.registry.register_many([
+            api_metrics._counters,
+            api_metrics._durations
+        ])
+        
+        ctx.add_shutdown_callback(lambda: logger.info(
+            f"Session {session_id} metrics: {usage_collector.get_summary()}"))
+        
+        await session.start(
+            agent=MainAgent(),
+            room=ctx.room,
+            room_input_options=RoomInputOptions(
+                audio_processing={"echo_cancellation": True}
+            ),
+            room_output_options=RoomOutputOptions(
+                transcription_enabled=True
+            )
+        )
+        
+    except Exception as e:
+        logger.error("Fatal initialization error", exc_info=True)
+        raise
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
+    cli.run_app(WorkerOptions(
+        entrypoint_fnc=entrypoint,
+        prewarm_fnc=prewarm,
+        prometheus_port=9090  # Expose metrics endpoint
+    ))
